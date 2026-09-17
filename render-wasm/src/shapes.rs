@@ -1167,6 +1167,28 @@ impl Shape {
         self.expand_own_bounds(bounds).to_rect()
     }
 
+    /// Geometry, strokes and layer blur in world space, without this shape's own
+    /// drop shadows: those belong to the shape, not to an ancestor's shadow mask.
+    pub fn silhouette_rect(&self) -> math::Rect {
+        let mut bounds = self.own_base_bounds();
+
+        if matches!(self.shape_type, Type::Text(_)) {
+            let mut rect = bounds.to_rect();
+            rect.join(self.selrect);
+            bounds = Bounds::from_rect(&rect);
+        }
+
+        let max_stroke = Stroke::max_bounds_width(self.strokes.iter(), self.is_open());
+        bounds = self.apply_stroke_bounds(bounds, max_stroke);
+        bounds = self.apply_blur_bounds(bounds);
+
+        if !self.transform.is_identity() {
+            bounds.transform_mut(&self.centered_transform());
+        }
+
+        bounds.to_rect()
+    }
+
     fn calculate_extrect_uncached(&self, shapes_pool: ShapesPoolRef, scale: f32) -> math::Rect {
         // Own outsets (strokes, shadows, blur) are local-space, so they expand before the
         // shape transform. Children extrects are already world-space: join them after it.
@@ -1897,7 +1919,7 @@ impl Shape {
     /// The fast path draws fill geometry only. On the slow path, visible strokes also
     /// contribute to the shadow silhouette, so frames with outer/center strokes can
     /// look slightly narrower here. We keep them eligible anyway for performance.
-    pub fn uses_direct_container_drop_shadow(&self, tree: ShapesPoolRef, scale: f32) -> bool {
+    pub fn uses_direct_container_drop_shadow(&self, tree: ShapesPoolRef) -> bool {
         if !matches!(self.shape_type, Type::Frame(_)) {
             return false;
         }
@@ -1918,17 +1940,13 @@ impl Shape {
             return !self.descendants_have_drop_shadows(tree);
         }
 
-        self.descendants_contained_for_frame_shadow(tree, scale, self.selrect())
+        self.descendants_contained_for_frame_shadow(tree, self.selrect())
     }
 
     /// When true, the container's own fill shadow mask is enough and descendant
     /// silhouettes can be skipped (same geometry assumption as the direct path).
-    pub fn container_fill_covers_shadow_descendants(
-        &self,
-        tree: ShapesPoolRef,
-        scale: f32,
-    ) -> bool {
-        self.has_fills() && self.descendants_contained_for_frame_shadow(tree, scale, self.selrect())
+    pub fn container_fill_covers_shadow_descendants(&self, tree: ShapesPoolRef) -> bool {
+        self.has_fills() && self.descendants_contained_for_frame_shadow(tree, self.selrect())
     }
 
     fn descendants_have_drop_shadows(&self, tree: ShapesPoolRef) -> bool {
@@ -1952,13 +1970,8 @@ impl Shape {
     fn descendants_contained_for_frame_shadow(
         &self,
         tree: ShapesPoolRef,
-        scale: f32,
         bounds: math::Rect,
     ) -> bool {
-        if self.descendants_have_drop_shadows(tree) {
-            return false;
-        }
-
         const MARGIN: f32 = 0.5;
         for child_id in self.children_ids_iter(false) {
             let Some(child) = tree.get(child_id) else {
@@ -1967,13 +1980,10 @@ impl Shape {
             if child.hidden {
                 continue;
             }
-            let child_extrect = child.extrect(tree, scale);
-            if !rect_contains_with_margin(bounds, child_extrect, MARGIN) {
+            if !rect_contains_with_margin(bounds, child.silhouette_rect(), MARGIN) {
                 return false;
             }
-            if child.is_recursive()
-                && !child.descendants_contained_for_frame_shadow(tree, scale, bounds)
-            {
+            if child.is_recursive() && !child.descendants_contained_for_frame_shadow(tree, bounds) {
                 return false;
             }
         }
@@ -2240,7 +2250,7 @@ mod tests {
         ] {
             let (pool, frame_id) = frame_with_fill_and_child(fill, opacity);
             let frame = pool.get(&frame_id).expect("frame");
-            assert!(frame.uses_direct_container_drop_shadow(&pool, 1.0));
+            assert!(frame.uses_direct_container_drop_shadow(&pool));
         }
     }
 
@@ -2263,7 +2273,7 @@ mod tests {
         }
 
         let frame = pool.get(&frame_id).expect("frame");
-        assert!(!frame.uses_direct_container_drop_shadow(&pool, 1.0));
+        assert!(!frame.uses_direct_container_drop_shadow(&pool));
     }
 
     #[test]
@@ -2291,7 +2301,7 @@ mod tests {
         }
 
         let frame = pool.get(&frame_id).expect("frame");
-        assert!(frame.uses_direct_container_drop_shadow(&pool, 1.0));
+        assert!(frame.uses_direct_container_drop_shadow(&pool));
     }
 
     #[test]
@@ -2319,8 +2329,8 @@ mod tests {
         }
 
         let frame = pool.get(&frame_id).expect("frame");
-        assert!(!frame.uses_direct_container_drop_shadow(&pool, 1.0));
-        assert!(!frame.container_fill_covers_shadow_descendants(&pool, 1.0));
+        assert!(!frame.uses_direct_container_drop_shadow(&pool));
+        assert!(!frame.container_fill_covers_shadow_descendants(&pool));
     }
 
     #[test]
@@ -2328,7 +2338,32 @@ mod tests {
         let (pool, frame_id) =
             frame_with_fill_and_child(Fill::Solid(SolidColor(skia::Color::WHITE)), 1.0);
         let frame = pool.get(&frame_id).expect("frame");
-        assert!(frame.container_fill_covers_shadow_descendants(&pool, 1.0));
+        assert!(frame.container_fill_covers_shadow_descendants(&pool));
+    }
+
+    #[test]
+    fn unclipped_frame_with_contained_shadowed_child_covers_descendants() {
+        let (mut pool, frame_id) =
+            frame_with_fill_and_child(Fill::Solid(SolidColor(skia::Color::WHITE)), 1.0);
+        let child_id = pool.get(&frame_id).expect("frame").children[0];
+        pool.get_mut(&frame_id).expect("frame").set_clip(false);
+
+        {
+            let child = pool.get_mut(&child_id).expect("child");
+            // Shadow reaches past the frame; the geometry stays inside.
+            child.add_shadow(Shadow::new(
+                skia::Color::BLACK,
+                20.0,
+                0.0,
+                (0.0, 20.0),
+                ShadowStyle::Drop,
+                false,
+            ));
+        }
+
+        let frame = pool.get(&frame_id).expect("frame");
+        assert!(frame.container_fill_covers_shadow_descendants(&pool));
+        assert!(frame.uses_direct_container_drop_shadow(&pool));
     }
 
     #[test]
@@ -2351,6 +2386,6 @@ mod tests {
         }
 
         let frame = pool.get(&frame_id).expect("frame");
-        assert!(frame.uses_direct_container_drop_shadow(&pool, 1.0));
+        assert!(frame.uses_direct_container_drop_shadow(&pool));
     }
 }
