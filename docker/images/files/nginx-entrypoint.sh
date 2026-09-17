@@ -119,7 +119,41 @@ else
     PENPOT_CSP_POLICY_IS_CUSTOM="false"
 fi
 
-export PENPOT_CSP_POLICY=${PENPOT_CSP_POLICY:-"default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval'${PENPOT_CSP_SCRIPT_HASHES}; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' blob: data:; worker-src 'self' blob:; media-src 'self' blob:; frame-src 'self'; manifest-src 'self'"}
+# Directives a deployment may extend. The default policy carries hashes that
+# change on every build, so a deployment that needs an extra origin cannot
+# hardcode the whole policy without recomputing them at each release. These
+# variables let it declare only what it adds.
+#
+# base-uri, form-action, object-src and frame-ancestors are deliberately not
+# extensible: there is no legitimate reason to relax them, and doing so
+# silently removes the protection they provide. A deployment that really
+# needs it can still set PENPOT_CSP_POLICY and own the whole policy.
+if [ "${PENPOT_CSP_POLICY_IS_CUSTOM}" = "false" ]; then
+    export PENPOT_CSP_POLICY="default-src 'self'\
+; base-uri 'self'\
+; object-src 'none'\
+; frame-ancestors 'self'\
+; form-action 'self'\
+; manifest-src 'self'\
+; script-src 'self' 'wasm-unsafe-eval'${PENPOT_CSP_SCRIPT_HASHES}${PENPOT_CSP_SCRIPT_SRC_EXTRA:+ ${PENPOT_CSP_SCRIPT_SRC_EXTRA}}\
+; style-src 'self' 'unsafe-inline'${PENPOT_CSP_STYLE_SRC_EXTRA:+ ${PENPOT_CSP_STYLE_SRC_EXTRA}}\
+; img-src 'self' data: blob:${PENPOT_CSP_IMG_SRC_EXTRA:+ ${PENPOT_CSP_IMG_SRC_EXTRA}}\
+; font-src 'self'${PENPOT_CSP_FONT_SRC_EXTRA:+ ${PENPOT_CSP_FONT_SRC_EXTRA}}\
+; connect-src 'self' blob: data:${PENPOT_CSP_CONNECT_SRC_EXTRA:+ ${PENPOT_CSP_CONNECT_SRC_EXTRA}}\
+; frame-src 'self'${PENPOT_CSP_FRAME_SRC_EXTRA:+ ${PENPOT_CSP_FRAME_SRC_EXTRA}}\
+; worker-src 'self' blob:\
+; media-src 'self' blob:${PENPOT_CSP_REPORT_URI:+; report-uri ${PENPOT_CSP_REPORT_URI}}"
+else
+    for _var in SCRIPT_SRC_EXTRA STYLE_SRC_EXTRA IMG_SRC_EXTRA FONT_SRC_EXTRA \
+                CONNECT_SRC_EXTRA FRAME_SRC_EXTRA REPORT_URI; do
+        eval "_value=\${PENPOT_CSP_${_var}:-}"
+        if [ -n "${_value}" ]; then
+            echo "penpot: WARNING: PENPOT_CSP_${_var} is ignored because PENPOT_CSP_POLICY defines the whole policy." >&2
+        fi
+    done
+    unset _var _value
+    export PENPOT_CSP_POLICY
+fi
 
 case "${PENPOT_CSP_MODE}" in
     enforce)
