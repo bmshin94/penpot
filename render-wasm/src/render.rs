@@ -3142,6 +3142,8 @@ impl RenderState {
 
     /// Renders descendant silhouettes into the current drop-shadow layer.
     #[allow(clippy::too_many_arguments)]
+    // Kept out of line so profiles can separate it from the element's own shadow.
+    #[inline(never)]
     fn render_drop_shadow_child_silhouettes(
         &mut self,
         element: &Shape,
